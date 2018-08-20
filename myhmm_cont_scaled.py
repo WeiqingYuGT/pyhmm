@@ -46,37 +46,52 @@ Date: 1 March 2015
     The code in this module applies the corrections mentioned in this errata
     
 """
-import json
-import os
+#import json
+#import os
 import sys
 import math
+import numpy as np
+import heapq
 
-class MyHmmScaled(object):
+class MyHmmContScaled(object):
     # base class for different HMM models - implements Rabiner's algorithm for scaling to avoid underflow
-    def __init__(self, model_name):
+    def __init__(self, model):
         # model is (A, B, pi) where A = Transition probs, B = Emission Probs, pi = initial distribution
         # a model can be initialized to random parameters using a json file that has a random params model
-        if model_name == None:
-            print "Fatal Error: You should provide the model file name"
+        def eachInv(x):
+            return np.matrix(x).I
+        
+        if model == None:
+            print "Fatal Error: You should provide the initial model"
             sys.exit()
-        self.model = json.loads(open(model_name).read())["hmm"]
-        self.A = self.model["A"]
-        self.states = self.A.keys() # get the list of states
+#        self.model = json.loads(open(model_name).read())["hmm"]
+        self.model = model
+        self.A = np.array(self.model["A"])
+        self.states = range(self.A.shape[0]) # get the list of states
         self.N = len(self.states) # number of states of the model
-        self.B = self.model["B"]
-        self.symbols = self.B.values()[0].keys() # get the list of symbols, assume that all symbols are listed in the B matrix
-        self.M = len(self.symbols) # number of states of the model
+        self.means = np.array(self.model["means"])
+        self.covars = np.array(self.model["cov"])
+        self.covarsInv = np.array([eachInv(x) for x in self.covars])
+        self.M = self.means.shape[0] # number of states of the model
+        self.d = self.means.shape[1]
         self.pi = self.model["pi"]
-
-        # the following are defined to support log version of viterbi
-        # we assume that the forward and backward functions use the scaled model
-        self.logA = {}
-        self.logB = {}
-        self.logpi = {}
-        self.set_log_model()
+        self.min_std = self.model['mstd']
+        
         
         return
 
+    def _pdf(self, x, mean, covarInv):
+        inv_covar_det = np.linalg.det(covarInv)
+        c = ( ( (2.0*np.pi)**(-float(self.d)/2) * (inv_covar_det)**(0.5)))
+        pdfval = c * np.exp(-0.5 * np.dot( np.dot((x-mean),covarInv), (x-mean)))
+        return max(pdfval,1e-20)
+    
+    def _lpdf(self, x, mean, covarInv):
+        inv_covar_det = np.linalg.det(covarInv)
+        lpdfval = -float(self.d)/2*math.log(2*np.pi)+0.5*math.log(inv_covar_det)-\
+            0.5 * np.dot( np.dot((x-mean),covarInv), (x-mean))
+        return lpdfval
+        
     def set_log_model(self):        
         for y in self.states:
             self.logA[y] = {}
@@ -91,14 +106,15 @@ class MyHmmScaled(object):
             if self.pi[y] == 0:
                 self.logpi[y] =  sys.float_info.min # this is to handle symbols that never appear in the dataset
             else:
-                self.logpi[y] = math.log(self.pi[y])                
+                self.logpi[y] = math.log(self.pi[y])
 
     def viterbi_log(self, obs):
         vit = [{}]
-        path = {}     
+        path = {}
+        logpi, logA = np.log(self.pi), np.log(self.A)
         # Initialize base cases (t == 0)
         for y in self.states:
-            vit[0][y] = self.logpi[y] + self.logB[y][obs[0]]
+            vit[0][y] = logpi[y] + self._lpdf(obs[0],self.means[y],self.covarsInv[y])
             path[y] = [y]
      
         # Run Viterbi for t > 0
@@ -106,7 +122,9 @@ class MyHmmScaled(object):
             vit.append({})
             newpath = {}     
             for y in self.states:
-                (prob, state) = max((vit[t-1][y0] + self.logA[y0][y] + self.logB[y][obs[t]], y0) for y0 in self.states)
+                (prob, state) = max((vit[t-1][y0] + logA[y0][y] + \
+                    self._lpdf(obs[t],self.means[y],self.covarsInv[y]), y0)\
+                    for y0 in self.states)
                 vit[t][y] = prob
                 newpath[y] = path[state] + [y]
             # Don't need to remember the old paths
@@ -116,6 +134,42 @@ class MyHmmScaled(object):
             n = t
         (prob, state) = max((vit[n][y], y) for y in self.states)
         return (prob, path[state])
+
+    def viterbi_k_log(self,obs,k):
+        vit = [{}]
+        path = {}
+        logpi, logA = np.log(self.pi), np.log(self.A)
+        for y in self.states:
+            vit[0][y] = [logpi[y] + self._lpdf(obs[0],self.means[y],self.covarsInv[y])]
+            path[y] = [[y]]
+        
+        for t in range(1,len(obs)):
+            vit.append({})
+            newpath = {}
+            for y in self.states:
+                newheap = []
+                for y0 in self.states:
+                    for i in range(len(vit[t-1][y0])):
+                        v, p = vit[t-1][y0][i], path[y0][i]
+                        if len(newheap)<k:
+                            heapq.heappush(newheap,(v+logA[y0][y]+self._lpdf(obs[t], \
+                                        self.means[y],self.covarsInv[y]),p+[y]))
+                        else:
+                            heapq.heappushpop(newheap,(v+logA[y0][y]+self._lpdf(obs[t],\
+                                        self.means[y],self.covarsInv[y]),p+[y]))
+                vit[t][y] = [x[0] for x in newheap]
+                newpath[y] = [x[1] for x in newheap]
+            path = newpath
+        n, res = 0, []
+        if len(obs)!=1:
+            n = t
+        for y in self.states:
+            for i in range(len(vit[n][y])):
+                if len(res)<k:
+                    heapq.heappush(res,(vit[n][y][i],path[y][i]))
+                else:
+                    heapq.heappushpop(res,(vit[n][y][i],path[y][i]))
+        return res
 
     def backward_scaled(self, obs):
         # uses the clist created during forward_scaled function
@@ -132,11 +186,11 @@ class MyHmmScaled(object):
                 self.bwk_scaled[T-1][y] = self.clist[T-1] * 1.0 #
             except:
                 print "EXCEPTION OCCURED in backward_scaled, T -1 = ", T -1
-            
+        
         for t in reversed(range(T-1)):
             beta_local = {}
             for y in self.states:
-                beta_local[y] = sum((self.bwk_scaled[t+1][y1] * self.A[y][y1] * self.B[y1][obs[t+1]]) for y1 in self.states)
+                beta_local[y] = sum((self.bwk_scaled[t+1][y1] * self.A[y][y1] * self._pdf(obs[t+1],self.means[y1],self.covarsInv[y1])) for y1 in self.states)
                 
             for y in self.states:
                 self.bwk_scaled[t][y] = self.clist[t] * beta_local[y]
@@ -170,7 +224,7 @@ class MyHmmScaled(object):
         self.fwd_scaled = [{}] # fwd_scaled is the variable alpha_caret in Rabiner book
         # Initialize base cases (t == 0)
         for y in self.states:
-            self.fwd[0][y] = self.pi[y] * self.B[y][obs[0]]
+            self.fwd[0][y] = self.pi[y] * self._pdf(obs[0],self.means[y],self.covarsInv[y])
 
         # get c1 for base case
         c1 = self.compute_cvalue(self.fwd[0], self.states)
@@ -181,15 +235,24 @@ class MyHmmScaled(object):
             
         # Run Forward algorithm for t > 0
         for t in range(1, len(obs)):
-            self.fwd.append({})     
-            self.fwd_scaled.append({})     
+            self.fwd.append({})
+            self.fwd_scaled.append({})
             for y in self.states:
                 #self.fwd[t][y] = sum((self.fwd[t-1][y0] * self.A[y0][y] * self.B[y][obs[t]]) for y0 in self.states)
+                accm = 0.0
                 for y0 in self.states:
-                    local_alpha[y] = sum((self.fwd_scaled[t-1][y0] * self.A[y0][y] * self.B[y][obs[t]]))
-                    if (local_alpha[y] == 0):
-                        print "ERROR local alpha is zero: y = ", y, "  y0 = ", y0
-                        print "fwd = %3f, A = %3f, B = %3f, obs = %s" % (self.fwd_scaled[t - 1][y0], self.A[y0][y], self.B[y][obs[t]], obs[t])
+                    pval = (self.fwd_scaled[t-1][y0] * \
+                               self.A[y0][y] * self._pdf(obs[t],self.means[y],\
+                                self.covarsInv[y]))
+                    accm+=pval
+#                    if accm==0:
+#                        print self.fwd_scaled[t-1][y0], self._pdf(obs[t],self.means[y],\
+#                                self.covarsInv[y]), obs[t],self.means[y],\
+#                                self.covarsInv[y]
+                local_alpha[y] = max(accm,1e-20)
+                if (local_alpha[y] == 0):
+                    raise Exception("ERROR local alpha is zero: y = ", y,self.fwd_scaled[t-1]) #, "  y0 = ", y0
+#                        print "fwd = %3f, A = %3f, B = %3f, obs = %s" % (self.fwd_scaled[t - 1][y0], self.A[y0][y], self.B[y][obs[t]], obs[t])
 
             c1 = self.compute_cvalue(local_alpha, self.states)
             self.clist.append(c1)
@@ -218,7 +281,7 @@ class MyHmmScaled(object):
             for y in self.states:
                 (prob, state) = max((vit[t-1][y0] * self.A[y0][y] * self.B[y][obs[t]], y0) for y0 in self.states)
                 vit[t][y] = prob
-                newpath[y] = path[state] + [y]     
+                newpath[y] = path[state] + [y]
             # Don't need to remember the old paths
             path = newpath
         n = 0           # if only one element is observed max is sought in the initialization values
@@ -227,86 +290,87 @@ class MyHmmScaled(object):
         (prob, state) = max((vit[n][y], y) for y in self.states)
         return (prob, path[state])
 
-    def forward_backward_multi_scaled(self, obslist): # returns model given the initial model and observations
+    def forward_backward_multi_scaled(self, obslist, thresh): # returns model given the initial model and observations
         count = 40
+        def eachInv(x):
+            return np.matrix(x).I
+        log_p = -100000.0
         for iteration in range(count):
-            tables = self.create_zi_gamma_tables(obslist)            
+            tables = self.create_xi_gamma_tables(obslist)            
             # compute transition probability
-            temp_aij = {}
-            temp_bjk = {}
-            temp_pi = {}
+            temp_aij = np.zeros(self.A.shape)
+            temp_means = np.zeros(self.means.shape)
+            temp_cov = np.zeros(self.covars.shape)
+            temp_pi = np.zeros(self.N)
 
             for i in self.states:
-                temp_aij[i] = {}
-                temp_bjk[i] = {}
                 temp_pi[i] = self.compute_pi(tables, i)
-                for sym in self.symbols:
-                    temp_bjk[i][sym] = self.compute_bj(tables, i, obslist, sym)
+                temp_means[i], temp_cov[i] = self.compute_dist(tables,i,obslist)
                 for j in self.states:
                     temp_aij[i][j] = self.compute_aij(tables, i, j)
-            normalizer = 0.0
-            for v in temp_pi.values():
-                normalizer += v
-            for k, v in temp_pi.items():
-                temp_pi[k] = v / normalizer
+            temp_pi = temp_pi/sum(temp_pi)
 
             self.A = temp_aij
-            self.B = temp_bjk
+            self.means = temp_means
+            self.covars = temp_cov
+            self.covarsInv = np.array([eachInv(x) for x in self.covars])
             self.pi = temp_pi
-        
-        return (temp_aij, temp_bjk, temp_pi)
+            log_p1 = -sum([math.log(c) for c in self.clist])
+            print "Iter: ", iteration, "; Current Log-Likelihood: ", log_p1
+            if (log_p1-log_p)<thresh:
+                print "Converged! Existing..."
+                break
+            log_p = log_p1
+        return (temp_aij, temp_means, temp_cov, temp_pi)
 
     # compute aij for a given (i, j) pair of states
     def compute_aij(self, tables, i, j):
-        zi_table = tables["zi_table"] # this will have zi values [k][t][i][j]
+        xi_table = tables["xi_table"] # this will have xi values [k][t][i][j]
         gamma_table = tables["gamma_table"] # this will have gamma values [k][t][i]
         numerator = 0.0
         denominator = 0.0
         
-        for k in range(len(zi_table)): # sum over all observations in the multi list
-            for t in range(len(zi_table[k]) - 1): # sum over all t up to Tk - 1
-                denominator += gamma_table[k][t][i] # zi value for i, j
-                numerator += zi_table[k][t][i][j] # zi value for i, j
+        for k in range(len(xi_table)): # sum over all observations in the multi list
+            for t in range(len(xi_table[k]) - 1): # sum over all t up to Tk - 1
+                denominator += gamma_table[k][t][i] # xi value for i, j
+                numerator += xi_table[k][t][i][j] # xi value for i, j
         aij = numerator / denominator
         return aij
 
     # compute the emission probabilities of a given state i emitting symbol
-    def compute_bj(self, tables, i, obslist, symbol):
-        threshold = 0 # TODO: support for setting some minimum value if bj turns out to be 0 - we also need to ensure probabilities sum to 1
+    def compute_dist(self, tables, i, obslist):
+#        threshold = 0 # TODO: support for setting some minimum value if bj turns out to be 0 - we also need to ensure probabilities sum to 1
         gamma_table = tables["gamma_table"] # this will have gamma values [k][t][i]
-        numerator =  0.0 
+        numerator_mean =  np.zeros(self.d)
+        numerator_cov = np.zeros(self.covars[0].shape)
+        cov_prior = np.eye(self.d)*self.min_std
         denominator = 0.0
-        
-        for k in range(len(gamma_table)): # sum over all observations in the multi list
-            for t in range(len(gamma_table[k]) - 1): # sum over all t up to Tk - 1
-                denominator += gamma_table[k][t][i] # zi value for i, j
-                if obslist[k][t] == symbol:
-                    numerator += gamma_table[k][t][i] #zi_table[k][t][i][j] # zi value for i, j
-        bj = numerator / denominator
-        if bj == 0:
-            bj = threshold
-        return bj
+        for k in range(len(gamma_table)):
+            for t in range(len(gamma_table[k])-1):
+                denominator += gamma_table[k][t][i]
+                numerator_mean += gamma_table[k][t][i] * obslist[k][t]
+                numerator_cov += gamma_table[k][t][i] * \
+                    np.outer(obslist[k][t]-self.means[i],obslist[k][t]-self.means[i])
+        mean_new = numerator_mean/denominator
+        covar_new = numerator_cov/denominator+cov_prior
+        return mean_new, covar_new
 
     # compute the initial probabilities of a given state i 
     def compute_pi(self, tables, i):
         gamma_table = tables["gamma_table"] # this will have gamma values [k][t][i]
-        numerator = 0.0
-        denominator = 0.0
 
         pi = 0.0
         for k in range(len(gamma_table)): # sum over all observations in the multi list
-            pi += gamma_table[k][0][i] #zi_table[k][t][i][j] # zi value for i, j
+            pi += gamma_table[k][0][i] #xi_table[k][t][i][j] # xi value for i, j
         return pi
 
-
-
-    def compute_zi(self, alphas, betas, qi, qj, obs):
-        # given alpha and beta tables and the states qi, qj, computes zi values, assumes A, B, pi are available
-        zi = alphas[qi] * self.A[qi][qj] * self.B[qj][obs] * betas[qj]
-        return zi
+    def compute_xi(self, alphas, betas, qi, qj, obs):
+        # given alpha and beta tables and the states qi, qj, computes xi values, assumes A, B, pi are available
+        xi = alphas[qi] * self.A[qi][qj] * self._pdf(obs,self.means[qj],self.covarsInv[qj]) * betas[qj]
+        return xi
         
     def compute_gamma(self, alphas, betas, qi, ct):
-        # given alpha and beta tables and the states qi, qj, computes zi values, assumes A, B, pi are available
+        # given alpha and beta tables and the states qi, qj, computes xi values, assumes A, B, pi are available
         gam = (alphas[qi] * betas[qi]) / float(ct)
         if gam == 0:
             # TODO: Handle any error situation arising due to gamma = 0
@@ -314,13 +378,13 @@ class MyHmmScaled(object):
             pass
         return gam
 
-    def create_zi_gamma_tables(self, obslist):
-        # we will create a table for zi that stores zi(i, j) for all t and all k, all i and j
+    def create_xi_gamma_tables(self, obslist):
+        # we will create a table for xi that stores xi(i, j) for all t and all k, all i and j
         # also create a table for gamma that stores gamma(i) for all t and all k, all i
         # where t is the sequence index: 1 <= t <= Tk - 1
         # and k is the observation number: 1 <= k <= K
         
-        zi_table = [] # each element in this is for a given obs in obslist, obs is a vector of symbols
+        xi_table = [] # each element in this is for a given obs in obslist, obs is a vector of symbols
         gamma_table = [] # each element in this is for a given obs in obslist, obs is a vector of symbols
         
         for obs in obslist: # do for every observation sequence from the multi observation list
@@ -328,21 +392,21 @@ class MyHmmScaled(object):
             # these will set up scaled alpha and beta tables properly for the given observation sequence
             self.forward_scaled(obs)
             self.backward_scaled(obs)
-            #zi_obs = [] # this holds the zi for kth observation
-            zi_t = [] # this holds the zi for Tk - 1
+            #xi_obs = [] # this holds the xi for kth observation
+            xi_t = [] # this holds the xi for Tk - 1
             gamma_t = [] # this holds the gamma for Tk - 1
 
             for t in range(len(obs) - 1): # 1 <= t <= Tk - 1
-                zi_t.append({}) # this holds zi for the given k and t - it should have (i, j) entries
+                xi_t.append({}) # this holds xi for the given k and t - it should have (i, j) entries
                 gamma_t.append({}) # this holds gamma for the given k and t - it should have i entries
                 for i in self.states:
-                    zi_t[t][i] = {}
+                    xi_t[t][i] = {}
                     gamma_t[t][i] = self.compute_gamma(self.fwd_scaled[t], self.bwk_scaled[t], i, self.clist[t])
                     for j in self.states:
-                        zi_t[t][i][j] = self.compute_zi(self.fwd_scaled[t], self.bwk_scaled[t + 1], i, j, obs[t + 1])
-            zi_table.append(zi_t)
+                        xi_t[t][i][j] = self.compute_xi(self.fwd_scaled[t], self.bwk_scaled[t + 1], i, j, obs[t + 1])
+            xi_table.append(xi_t)
             gamma_table.append(gamma_t)
-        return {"zi_table": zi_table, "gamma_table": gamma_table}
+        return {"xi_table": xi_table, "gamma_table": gamma_table}
 
 #if __name__ == '__main__':
     

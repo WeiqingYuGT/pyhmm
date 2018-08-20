@@ -11,6 +11,7 @@
                        "Coin 2" : {"Heads": 0.3, "Tails": 0.7},
                        "Coin 3" : {"Heads": 0.5, "Tails": 0.5}
                 },
+		"C": [1,2,3,4],
                 "pi": {"Coin 1": 0.4, "Coin 2": 0.3, "Coin 3": 0.3}        
             }
         
