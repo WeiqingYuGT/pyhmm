@@ -6,9 +6,9 @@ Created on Fri Aug 17 15:49:24 2018
 @author: weiqing.yu@groundtruth.com
 """
 
-def state_change_segment(states):
+def state_change_segment(states, cut):
     def smap(s):
-        return int(s in (2,3,4))
+        return int(s > cut)
     res = [[smap(states[0]),0]]
     for i in range(1,len(states)):
         s = states[i]
