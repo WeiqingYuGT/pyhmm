@@ -53,6 +53,7 @@ import math
 import numpy as np
 import heapq
 import time
+import pickle
 
 class MyHmmContScaled(object):
     # base class for different HMM models - implements Rabiner's algorithm for scaling to avoid underflow
@@ -239,7 +240,10 @@ class MyHmmContScaled(object):
         self.fwd_scaled = [{}] # fwd_scaled is the variable alpha_caret in Rabiner book
         # Initialize base cases (t == 0)
         for y in self.states:
-            self.fwd[0][y] = self.pi[y] * self.prob_cache[obsInd][0][y]
+            try:
+                self.fwd[0][y] = self.pi[y] * self.prob_cache[obsInd][0][y]
+            except:
+                raise Exception(obsInd,len(self.prob_cache))
 #            self._mpdf(obs[0],self.weights[y],\
 #                    self.means[y],self.covarsInv[y])
 
@@ -349,7 +353,7 @@ class MyHmmContScaled(object):
             log_p1 = -sum([math.log(c) for c in self.clist])
             print "Iter:", iteration, " Current Log-Likelihood: ", log_p1\
                 ,"Took", (time.time()-start_time), "seconds"
-            if (log_p1-log_p)<thresh:
+            if (log_p1-log_p)<thresh and iteration>5:
                 print "Converged! Existing..."
                 break
             log_p = log_p1
@@ -462,3 +466,10 @@ class MyHmmContScaled(object):
             gamma_table.append(gamma_t)
             gamma_mix_tab.append(gamma_mix)
         return {"xi_table": xi_table, "gamma_table": gamma_table, "gamma_mix_tab":gamma_mix_tab}
+    
+    def save_model(self,path):
+        with open(path,'wb') as f:
+            pickle.dump(self, f, pickle.HIGHEST_PROTOCOL)
+        print "SAVED"
+        return 
+    
